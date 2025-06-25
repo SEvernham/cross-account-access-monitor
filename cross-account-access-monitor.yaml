@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Monitor cross-account access and send SNS email notifications when external accounts access resources'
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+  
+  OrganizationId:
+    Type: String
+    Description: AWS Organization ID (optional - leave blank to monitor all external accounts)
+    Default: ''
+  
+  MonitoredServices:
+    Type: CommaDelimitedList
+    Description: AWS services to monitor (e.g., dynamodb, s3, ec2)
+    Default: 'dynamodb,s3,ec2,rds,lambda'
+
+Resources:
+  # SNS Topic for notifications
+  CrossAccountAccessTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: CrossAccountAccessAlerts
+      DisplayName: Cross Account Access Alerts
+      
+  # SNS Subscription for email notifications
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref CrossAccountAccessTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudTrail for logging API calls
+  CrossAccountCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: CrossAccountAccessTrail
+      S3BucketName: !Ref CloudTrailBucket
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: 'AWS::S3::Object'
+              Values: ['arn:aws:s3:::*/*']
+            - Type: 'AWS::DynamoDB::Table'
+              Values: ['arn:aws:dynamodb:*:*:table/*']
+
+  # S3 Bucket for CloudTrail logs
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cross-account-cloudtrail-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # S3 Bucket Policy for CloudTrail
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+  # EventBridge Rule to detect cross-account access
+  CrossAccountAccessRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: CrossAccountAccessDetection
+      Description: Detect when external accounts access resources
+      EventPattern:
+        source:
+          - aws.dynamodb
+          - aws.s3
+          - aws.ec2
+          - aws.rds
+          - aws.lambda
+        detail:
+          userIdentity:
+            type:
+              - AssumedRole
+              - IAMUser
+              - Root
+          recipientAccountId:
+            - !Ref AWS::AccountId
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CrossAccountAccessFunction.Arn
+          Id: CrossAccountAccessTarget
+
+  # Lambda function to process events and send notifications
+  CrossAccountAccessFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CrossAccountAccessProcessor
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref CrossAccountAccessTopic
+          CURRENT_ACCOUNT_ID: !Ref AWS::AccountId
+          ORGANIZATION_ID: !Ref OrganizationId
+          MONITORED_SERVICES: !Join [',', !Ref MonitoredServices]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Extract event details
+                  detail = event.get('detail', {})
+                  user_identity = detail.get('userIdentity', {})
+                  source_account = user_identity.get('accountId', 'Unknown')
+                  current_account = os.environ['CURRENT_ACCOUNT_ID']
+                  organization_id = os.environ.get('ORGANIZATION_ID', '')
+                  
+                  # Skip if same account
+                  if source_account == current_account:
+                      return {'statusCode': 200, 'body': 'Same account access - ignored'}
+                  
+                  # Skip if organization member (if organization ID provided)
+                  if organization_id and is_organization_member(source_account, organization_id):
+                      return {'statusCode': 200, 'body': 'Organization member access - ignored'}
+                  
+                  # Extract relevant information
+                  event_name = detail.get('eventName', 'Unknown')
+                  event_source = detail.get('eventSource', 'Unknown')
+                  source_ip = detail.get('sourceIPAddress', 'Unknown')
+                  user_agent = detail.get('userAgent', 'Unknown')
+                  event_time = detail.get('eventTime', 'Unknown')
+                  
+                  # Create notification message
+                  message = create_notification_message(
+                      source_account, current_account, event_name, 
+                      event_source, source_ip, user_agent, event_time, user_identity
+                  )
+                  
+                  # Send SNS notification
+                  response = sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f'Cross-Account Access Alert - Account {current_account}',
+                      Message=message
+                  )
+                  
+                  return {'statusCode': 200, 'body': 'Notification sent successfully'}
+                  
+              except Exception as e:
+                  print(f'Error processing event: {str(e)}')
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+          
+          def is_organization_member(account_id, org_id):
+              # This is a simplified check - in production you might want to 
+              # maintain a list of organization accounts or use Organizations API
+              return False
+          
+          def create_notification_message(source_account, target_account, event_name, 
+                                        event_source, source_ip, user_agent, event_time, user_identity):
+              return f"""
+          CROSS-ACCOUNT ACCESS DETECTED
+          
+          Alert Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+          
+          ACCESS DETAILS:
+          - Source Account: {source_account}
+          - Target Account: {target_account}
+          - Event: {event_name}
+          - Service: {event_source}
+          - Event Time: {event_time}
+          
+          USER IDENTITY:
+          - Type: {user_identity.get('type', 'Unknown')}
+          - Principal ID: {user_identity.get('principalId', 'Unknown')}
+          - ARN: {user_identity.get('arn', 'Unknown')}
+          - User Name: {user_identity.get('userName', 'N/A')}
+          
+          NETWORK DETAILS:
+          - Source IP: {source_ip}
+          - User Agent: {user_agent}
+          
+          RECOMMENDATION:
+          Please review this access to ensure it is authorized. If this access is unexpected,
+          consider reviewing your cross-account trust policies and access permissions.
+          
+          For more details, check CloudTrail logs in the AWS Console.
+          """
+
+  # Lambda execution role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CrossAccountAccessLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref CrossAccountAccessTopic
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CrossAccountAccessFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CrossAccountAccessRule.Arn
+
+Outputs:
+  SNSTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref CrossAccountAccessTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+  
+  CloudTrailArn:
+    Description: ARN of the CloudTrail
+    Value: !GetAtt CrossAccountCloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrail'
+  
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt CrossAccountAccessFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
