@@ -253,6 +253,16 @@ For issues or questions:
 3. Verify IAM permissions for all components
 4. Ensure all required parameters are correctly configured
 
-## License
+### License
+This solution is provided as-is for educational and testing purposes. 
 
-This solution is provided as-is for educational and operational purposes. Review and test thoroughly before deploying in production environments.
+PRODUCTION DEPLOYMENT NOTICE
+This solution is intended as a reference architecture and is provided as educational and testing purposes only.
+Required before production deployment:
+  - Error handling implementation
+  - Logging implementation
+  - Compliance validation
+  - High availability configuration
+  - Performance optimization
+    
+No warranty is provided, express or implied. Production use requires thorough evaluation and testing for your specific environment.
