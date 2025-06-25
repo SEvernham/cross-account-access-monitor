@@ -253,8 +253,7 @@ For issues or questions:
 3. Verify IAM permissions for all components
 4. Ensure all required parameters are correctly configured
 
-### License
-This solution is provided as-is for educational and testing purposes. 
+## License
 
 **PRODUCTION DEPLOYMENT NOTICE**
 
